@@ -66,35 +66,85 @@ class sfPropelGenerator extends sfModelGenerator
   public function getManyToManyTables()
   {
     $tables = array();
+    $middleTables = array();
+    $foreignTables = array();
+    $relations = array();
 
-    // go through all tables to find m2m relationships
-    foreach ($this->dbMap->getTables() as $tableName => $table)
+    // go through all relations
+    $table = $this->getTableMap();
+    foreach  ($table->getRelations() as $relation)
     {
-      // load this table's relations and related tables
-      $table->getRelations();
-
-      foreach ($table->getColumns() as $column)
+      //we have a many to many Relation
+      if (RelationMap::MANY_TO_MANY === $relation->getType())
       {
-        if ($column->isForeignKey() && $column->isPrimaryKey() && $this->getTableMap()->getClassname() == $this->dbMap->getTable($column->getRelatedTableName())->getClassname())
-        {
-          // we have a m2m relationship
-          // find the other primary key
-          foreach ($table->getColumns() as $relatedColumn)
-          {
-            if ($relatedColumn->isForeignKey() && $relatedColumn->isPrimaryKey() && $this->getTableMap()->getClassname() != $this->dbMap->getTable($relatedColumn->getRelatedTableName())->getClassname())
-            {
-              // we have the related table
-              $tables[] = array(
-                'middleTable'   => $table,
-                'relatedTable'  => $this->dbMap->getTable($relatedColumn->getRelatedTableName()),
-                'column'        => $column,
-                'relatedColumn' => $relatedColumn,
-              );
+        $foreignTables[$relation->getLocalTable()->getClassname()] = $relation;
+      }
+      else if (RelationMap::ONE_TO_MANY === $relation->getType())
+      {
+        $relations[$relation->getLocalTable()->getClassname()] = $relation;
+      }
+    }
 
-              break 2;
-            }
+    // find middleTable for Many to Many relation
+    foreach ($foreignTables as $tableName => $relation)
+    {
+      $foreignTable = $relation->getLocalTable();
+      foreach ($foreignTable->getRelations() as $foreignRelation)
+      {
+        $foreignTableClassname = $foreignRelation->getLocalTable()->getClassname();
+
+        // Test if the foreign table has a common relation with our table
+        if (RelationMap::ONE_TO_MANY === $foreignRelation->getType()
+            && array_key_exists($foreignTableClassname, $relations))
+        {
+          $columns = $relations[$foreignTableClassname]->getLocalColumns();
+          $relatedColumns = $foreignRelation->getLocalColumns();
+
+          $middleTable = $foreignRelation->getLocalTable();
+          if ($middleTable->isCrossRef() && !isset($middleTables[$middleTable->getClassname()]))
+          {
+            // Add this middleTable to table list to prevent using it twice
+            $middleTables[$middleTable->getClassname()] = $middleTable;
+            $tables[] = array(
+              'middleTable'   => $middleTable,
+              'relatedTable'  => $foreignTable,
+              'column'        => reset($columns),
+              'relatedColumn' => reset($relatedColumns),
+            );
+            continue 2;
           }
         }
+      }
+    }
+
+    //Keep BC with M2M without isCrossRef = true
+    foreach ($relations as $relation)
+    {
+      $middleTable = $relation->getLocalTable();
+      //check if $middleTable is a Many 2 Many :
+      // exclude already found middle table
+      // if there it has 2  PKs
+      // if there id only 2 columns in the table
+      // if PKs are also FKs
+      if (!isset($middleTables[$middleTable->getClassname()])
+        && 2 === count($pks = $middleTable->getPrimaryKeyColumns())
+        && 2 === count($middleTable->getColumns())
+        && $pks[0]->isForeignKey()
+        && $pks[1]->isForeignKey())
+      {
+        //We found a Many to Many middle table
+        $foreignTable = $pks[0]->getRelatedTableName() != $table->getName() ? $pks[0]->getRelatedTable() : $pks[1]->getRelatedTable();
+        $relatedColumn = $pks[0]->getRelatedTableName() != $table->getName() ? $pks[0] : $pks[1];
+        $columns = $relation->getLocalColumns();
+        // Add this middleTable to table list to prevent using it twice
+        $middleTables[$middleTable->getClassname()] = $middleTable;
+
+        $tables[] = array(
+          'middleTable'   => $middleTable,
+          'relatedTable'  => $foreignTable,
+          'column'        => reset($columns),
+          'relatedColumn' => $relatedColumn,
+        );
       }
     }
 
@@ -133,7 +183,9 @@ class sfPropelGenerator extends sfModelGenerator
     // and all tables related to the related table maps (for m2m relations)
     foreach ($this->tableMap->getRelations() as $relation)
     {
-      $relation->getForeignTable()->getRelations();
+      foreach ($relation->getForeignTable()->getRelations() as $relationN) {
+          $relationN->getLocalTable()->getRelations();
+      }
     }
   }
 

@@ -87,14 +87,19 @@ class sfPropelFormGenerator extends sfGenerator
       $this->table = $table;
 
       // find the package to store forms in the same directory as the model classes
-      $packages = explode('.', constant(constant($table->getClassname().'::PEER').'::CLASS_DEFAULT'));
+      $reflClass = new ReflectionClass($table->getClassname());
+      $packages  = explode(DIRECTORY_SEPARATOR, $reflClass->getFileName());
       array_pop($packages);
+
       if (false === $pos = array_search($this->params['model_dir_name'], $packages))
       {
-        throw new InvalidArgumentException(sprintf('Unable to find the model dir name (%s) in the package %s.', $this->params['model_dir_name'], constant(constant($table->getClassname().'::PEER').'::CLASS_DEFAULT')));
+        throw new InvalidArgumentException(
+          sprintf('Unable to find the model dir name (%s) in the package %s.', $this->params['model_dir_name'], implode('.', $packages))
+        );
       }
+
       $packages[$pos] = $this->params['form_dir_name'];
-      $baseDir = sfConfig::get('sf_root_dir').'/'.implode(DIRECTORY_SEPARATOR, $packages);
+      $baseDir = implode(DIRECTORY_SEPARATOR, $packages);
 
       if (!is_dir($baseDir.'/base'))
       {
@@ -119,32 +124,86 @@ class sfPropelFormGenerator extends sfGenerator
   public function getManyToManyTables()
   {
     $tables = array();
+    $middleTables = array();
+    $foreignTables = array();
+    $relations = array();
 
-    // go through all tables to find m2m relationships
-    foreach ($this->dbMap->getTables() as $tableName => $table)
+    // go through all relations
+    foreach  ($this->table->getRelations() as $relation)
     {
-      foreach ($table->getColumns() as $column)
+      //we have a many to many Relation
+      if (RelationMap::MANY_TO_MANY === $relation->getType())
       {
-        if ($column->isForeignKey() && $column->isPrimaryKey() && $this->table->getClassname() == $this->getForeignTable($column)->getClassname())
-        {
-          // we have a m2m relationship
-          // find the other primary key
-          foreach ($table->getColumns() as $relatedColumn)
-          {
-            if ($relatedColumn->isForeignKey() && $relatedColumn->isPrimaryKey() && $this->table->getClassname() != $this->getForeignTable($relatedColumn)->getClassname())
-            {
-              // we have the related table
-              $tables[] = array(
-                'middleTable'   => $table,
-                'relatedTable'  => $this->getForeignTable($relatedColumn),
-                'column'        => $column,
-                'relatedColumn' => $relatedColumn,
-              );
+        $foreignTables[$relation->getLocalTable()->getClassname()] = $relation;
+      }
+      else if (RelationMap::ONE_TO_MANY === $relation->getType())
+      {
+        $relations[$relation->getLocalTable()->getClassname()] = $relation;
+      }
+    }
 
-              break 2;
-            }
+    // find middleTable for Many to Many relation
+    foreach ($foreignTables as $tableName => $relation)
+    {
+      $foreignTable = $relation->getLocalTable();
+      foreach ($foreignTable->getRelations() as $foreignRelation)
+      {
+        $foreignTableClassname = $foreignRelation->getLocalTable()->getClassname();
+
+        // Test if the foreign table has a common relation with our table
+        if (RelationMap::ONE_TO_MANY === $foreignRelation->getType()
+            && array_key_exists($foreignTableClassname, $relations))
+        {
+          $columns = $relations[$foreignTableClassname]->getLocalColumns();
+          $relatedColumns = $foreignRelation->getLocalColumns();
+
+          $middleTable = $foreignRelation->getLocalTable();
+          if ($middleTable->isCrossRef() && !isset($middleTables[$middleTable->getClassname()]))
+          {
+            // Add this middleTable to table list to prevent using it twice
+            $middleTables[$middleTable->getClassname()] = $middleTable;
+            $tables[] = array(
+              'middleTable'   => $middleTable,
+              'relatedGetter' => $foreignTable->getPhpname() == $relation->getName() ? 'get' . $middleTable->getPhpname() . 's' : 'get' . $relations[$middleTable->getClassname()]->getPluralName(),
+              'relatedTable'  => $foreignTable,
+              'column'        => reset($columns),
+              'relatedColumn' => reset($relatedColumns),
+            );
+            continue 2;
           }
         }
+      }
+    }
+
+    //Keep BC with M2M without isCrossRef = true
+    foreach ($relations as $relation)
+    {
+      $middleTable = $relation->getLocalTable();
+      //check if $middleTable is a Many 2 Many :
+      // exclude already found middle table
+      // if there it has 2  PKs
+      // if there id only 2 columns in the table
+      // if PKs are also FKs
+      if (!isset($middleTables[$middleTable->getClassname()])
+         && 2 === count($pks = $middleTable->getPrimaryKeyColumns())
+         && 2 === count($middleTable->getColumns())
+         && $pks[0]->isForeignKey()
+         && $pks[1]->isForeignKey())
+      {
+        //We found a Many to Many middle table
+        $foreignTable = $pks[0]->getRelatedTableName() != $this->table->getName() ? $pks[0]->getRelatedTable() : $pks[1]->getRelatedTable();
+        $relatedColumn = $pks[0]->getRelatedTableName() != $this->table->getName() ? $pks[0] : $pks[1];
+        $columns = $relation->getLocalColumns();
+        // Add this middleTable to table list to prevent using it twice
+        $middleTables[$middleTable->getClassname()] = $middleTable;
+
+        $tables[] = array(
+          'middleTable'   => $middleTable,
+          'relatedGetter' => $middleTable->getPhpname() == $relation->getName() ? 'get' . $middleTable->getPhpname() . 's' : 'get' . $relation->getPluralName(),
+          'relatedTable'  => $foreignTable,
+          'column'        => reset($columns),
+          'relatedColumn' => $relatedColumn,
+        );
       }
     }
 
@@ -284,7 +343,7 @@ class sfPropelFormGenerator extends sfGenerator
       $valueSet = $column->getValueSet();
       $choices = array_merge(array(''=>''), array_combine($valueSet, $valueSet));
 
-      $options[] = sprintf("'choices' => %s", preg_replace('/\s+/', '', var_export($choices, true)));
+      $options[] = sprintf("'choices' => %s", preg_replace('/[\n\r]+/', '', var_export($choices, true)));
     }
 
     return count($options) ? sprintf('array(%s)', implode(', ', $options)) : '';
@@ -402,7 +461,7 @@ class sfPropelFormGenerator extends sfGenerator
          break;
        case PropelColumnTypes::ENUM:
          $valueSet = $column->getValueSet();
-         $options[] = sprintf("'choices' => %s", preg_replace('/\s+/', '', var_export($valueSet, true)));
+         $options[] = sprintf("'choices' => %s", preg_replace('/[\n\r]+/', '', var_export($valueSet, true)));
          break;
       }
     }
